@@ -7,42 +7,61 @@ on:
     types: [submitted]
 
 jobs:
-  delete-issue-comment:
+  delete-coderabbit-comments:
     if: >
-      github.event_name == 'issue_comment' &&
-      github.event.issue.pull_request &&
-      (github.event.comment.user.login == 'coderabbitai' || github.event.comment.user.login == 'coderabbitai[bot]')
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       (github.event.comment.user.login == 'coderabbitai' || github.event.comment.user.login == 'coderabbitai[bot]'))
+      ||
+      (github.event_name == 'pull_request_review' &&
+       (github.event.review.user.login == 'coderabbitai' || github.event.review.user.login == 'coderabbitai[bot]'))
     runs-on: ubuntu-latest
-    permissions:
-      issues: write
-      pull-requests: write
     steps:
-      - name: Delete CodeRabbit comment
+      # Fork PRs trigger `pull_request_review` without exposing repo secrets,
+      # so the App token can't be minted. Skip the job cleanly in that case
+      # instead of letting it fail loudly.
+      - name: Check secrets availability
+        id: check-secrets
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_ID: ${{ secrets.CODERABBIT_CLEANUP_APP_ID }}
         run: |
-          gh api -X DELETE "${{ github.event.comment.url }}"
+          if [ -z "$APP_ID" ]; then
+            echo "App secrets not available (likely a fork PR event); skipping."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
 
-  hide-review-summary:
-    if: >
-      github.event_name == 'pull_request_review' &&
-      (github.event.review.user.login == 'coderabbitai' || github.event.review.user.login == 'coderabbitai[bot]')
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
-    steps:
-      - name: Minimize CodeRabbit review comment
+      - name: Generate GitHub App token
+        if: steps.check-secrets.outputs.available == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.CODERABBIT_CLEANUP_APP_ID }}
+          private-key: ${{ secrets.CODERABBIT_CLEANUP_APP_PRIVATE_KEY }}
+
+      - name: Clean up CodeRabbit comments
+        if: steps.check-secrets.outputs.available == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NODE_ID: ${{ github.event.review.node_id }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
         run: |
-          # Hide the review summary using GraphQL minimizeComment mutation
-          gh api graphql -f query='
-            mutation {
-              minimizeComment(input: {subjectId: "'"${NODE_ID}"'", classifier: OFF_TOPIC}) {
-                minimizedComment {
-                  isMinimized
-                }
-              }
-            }
-          '
+          # Clear the body of all CodeRabbit reviews on this PR
+          # (We can't delete reviews, but clearing the body removes the spam
+          # while keeping inline code comments visible)
+          REVIEW_IDS=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
+            --jq '[.[] | select(.user.login == "coderabbitai[bot]" and .body != "") | .id] | .[]')
+
+          for REVIEW_ID in $REVIEW_IDS; do
+            gh api -X PUT "repos/${REPO}/pulls/${PR_NUMBER}/reviews/${REVIEW_ID}" \
+              -f body="."
+          done
+
+          # Delete all CodeRabbit issue comments on this PR
+          COMMENT_URLS=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
+            --jq '[.[] | select(.user.login == "coderabbitai[bot]") | .url] | .[]')
+
+          for URL in $COMMENT_URLS; do
+            gh api -X DELETE "$URL"
+          done
